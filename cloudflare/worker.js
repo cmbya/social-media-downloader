@@ -127,6 +127,67 @@ function methodNotAllowed(routeMethod) {
   )
 }
 
+function base64UrlEncode(value) {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64UrlDecode(value) {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null
+  try {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4)
+    const binary = atob(padded)
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+    return new TextDecoder().decode(bytes)
+  } catch {
+    return null
+  }
+}
+
+function rawImageUrlFromProxy(value, origin) {
+  try {
+    const proxy = new URL(value, origin)
+    if (proxy.pathname !== '/api/image') return null
+    const raw = proxy.searchParams.get('url')
+    return raw && /^https?:\/\//i.test(raw) ? raw : null
+  } catch {
+    return null
+  }
+}
+
+async function rewriteShortcutImageUrls(response, origin) {
+  if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) {
+    return response
+  }
+
+  let payload
+  try {
+    payload = await response.clone().json()
+  } catch {
+    return response
+  }
+  if (!payload?.success || !Array.isArray(payload.image_urls)) return response
+
+  let changed = false
+  const image_urls = payload.image_urls.map((value) => {
+    if (typeof value !== 'string') return value
+    const raw = rawImageUrlFromProxy(value, origin)
+    if (!raw) return value
+    changed = true
+    return `${origin}/api/image?source=${base64UrlEncode(raw)}`
+  })
+  if (!changed) return response
+
+  const headers = new Headers(response.headers)
+  headers.delete('content-length')
+  return new Response(JSON.stringify({ ...payload, image_urls }), {
+    status: response.status,
+    headers,
+  })
+}
+
 const worker = {
   /**
    * @param {Request} request
@@ -134,7 +195,21 @@ const worker = {
    * @param {{ waitUntil: (promise: Promise<unknown>) => void }} ctx
    */
   async fetch(request, env, ctx) {
-    const url = new URL(request.url)
+    let url = new URL(request.url)
+
+    // iOS Shortcuts can treat an encoded Instagram URL as a nested URL and
+    // lose everything after an `&`. Shortcut responses therefore use a
+    // Base64URL source token, which is restored here before the media proxy
+    // receives the request.
+    if (url.pathname === '/api/image' && url.searchParams.has('source')) {
+      const source = base64UrlDecode(url.searchParams.get('source') || '')
+      if (!source || !/^https?:\/\//i.test(source)) {
+        return Response.json({ success: false, error: 'Invalid image source.' }, { status: 400 })
+      }
+      url.searchParams.delete('source')
+      url.searchParams.set('url', source)
+      request = new Request(url.toString(), request)
+    }
 
     // Checked before routing, so nothing else on this hostname is ever
     // dispatched — see WEBHOOK_PATH. 301 rather than 404 so a crawler that has
@@ -212,7 +287,10 @@ const worker = {
       //
       // `env` carries the D1 binding. Handlers that do not need it ignore the
       // extra argument, exactly as they already do with `ctx`.
-      return route.handler(request, ctx, env)
+      const response = await route.handler(request, ctx, env)
+      return url.pathname === '/api/shortcut/resolve'
+        ? rewriteShortcutImageUrls(response, url.origin)
+        : response
     }
 
     // An /api/* path with no handler — the only thing that reaches here, since
