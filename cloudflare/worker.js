@@ -79,6 +79,22 @@ function unauthorizedResponse() {
   )
 }
 
+function hexEncode(value) {
+  return [...new TextEncoder().encode(value)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function hexDecode(value) {
+  const normalized = value.trim()
+  if (!/^(?:[0-9a-f]{2})+$/i.test(normalized)) return null
+  const bytes = new Uint8Array(normalized.length / 2)
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16)
+  }
+  return new TextDecoder().decode(bytes)
+}
+
 function rawImageUrlFromProxy(value, origin) {
   try {
     const proxy = new URL(value, origin)
@@ -109,19 +125,16 @@ async function rewriteShortcutImageUrls(response, origin) {
     return response
   }
 
-  let changed = false
-  const image_urls = payload.image_urls.map((value) => {
-    if (typeof value !== 'string') return value
-    const raw = rawImageUrlFromProxy(value, origin)
-    if (!raw) return value
-    changed = true
-    return raw
-  })
-  if (!changed) return response
+  const image_tokens = payload.image_urls
+    .map((value) => (typeof value === 'string' ? rawImageUrlFromProxy(value, origin) : null))
+    .filter(Boolean)
+    .map(hexEncode)
+
+  if (image_tokens.length === 0) return response
 
   const headers = new Headers(response.headers)
   headers.delete('content-length')
-  return new Response(JSON.stringify({ ...payload, image_urls }), {
+  return new Response(JSON.stringify({ ...payload, image_tokens }), {
     status: response.status,
     headers,
   })
@@ -138,7 +151,12 @@ async function handleShortcutImage(request, ctx, env) {
     return Response.json({ success: false, error: '请求必须是 JSON 格式。' }, { status: 400 })
   }
 
-  const imageUrl = typeof body?.url === 'string' ? body.url.trim() : ''
+  const token = typeof body?.token === 'string' ? body.token : ''
+  const imageUrl = hexDecode(token)
+  if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
+    return Response.json({ success: false, error: '图片令牌无效。' }, { status: 400 })
+  }
+
   let target
   try {
     target = new URL(imageUrl)
