@@ -127,23 +127,20 @@ function methodNotAllowed(routeMethod) {
   )
 }
 
-function base64UrlEncode(value) {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (const byte of bytes) binary += String.fromCharCode(byte)
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+function hexEncode(value) {
+  return [...new TextEncoder().encode(value)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
 }
 
-function base64UrlDecode(value) {
-  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null
-  try {
-    const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4)
-    const binary = atob(padded)
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
-    return new TextDecoder().decode(bytes)
-  } catch {
-    return null
+function hexDecode(value) {
+  const normalized = value.trim()
+  if (!/^(?:[0-9a-f]{2})+$/i.test(normalized)) return null
+  const bytes = new Uint8Array(normalized.length / 2)
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16)
   }
+  return new TextDecoder().decode(bytes)
 }
 
 function rawImageUrlFromProxy(value, origin) {
@@ -168,7 +165,13 @@ async function rewriteShortcutImageUrls(response, origin) {
   } catch {
     return response
   }
-  if (!payload?.success || !Array.isArray(payload.image_urls)) return response
+  if (
+    !payload?.success ||
+    payload.platform !== 'instagram' ||
+    !Array.isArray(payload.image_urls)
+  ) {
+    return response
+  }
 
   let changed = false
   const image_urls = payload.image_urls.map((value) => {
@@ -176,7 +179,7 @@ async function rewriteShortcutImageUrls(response, origin) {
     const raw = rawImageUrlFromProxy(value, origin)
     if (!raw) return value
     changed = true
-    return `${origin}/api/image?source=${base64UrlEncode(raw)}`
+    return `${origin}/api/image?source=${hexEncode(raw)}`
   })
   if (!changed) return response
 
@@ -197,12 +200,11 @@ const worker = {
   async fetch(request, env, ctx) {
     let url = new URL(request.url)
 
-    // iOS Shortcuts can treat an encoded Instagram URL as a nested URL and
-    // lose everything after an `&`. Shortcut responses therefore use a
-    // Base64URL source token, which is restored here before the media proxy
-    // receives the request.
+    // Keep the Instagram URL opaque to iOS Shortcuts, which otherwise can
+    // split a nested query string at `&`. Hex has no reserved URL characters
+    // and avoids Base64 padding/decoder differences across runtimes.
     if (url.pathname === '/api/image' && url.searchParams.has('source')) {
-      const source = base64UrlDecode(url.searchParams.get('source') || '')
+      const source = hexDecode(url.searchParams.get('source') || '')
       if (!source || !/^https?:\/\//i.test(source)) {
         return Response.json({ success: false, error: 'Invalid image source.' }, { status: 400 })
       }
