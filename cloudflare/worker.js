@@ -6,9 +6,6 @@ import {
 
 const WEBHOOK_PATH = '/api/billing/webhook'
 const SHORTCUT_IMAGE_PATH = '/api/shortcut/image'
-const BROWSER_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-const IMAGE_ACCEPT = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
 const PROTECTED_API_PATHS = new Set([
   '/api/download',
   '/api/shortcut/resolve',
@@ -130,7 +127,7 @@ async function rewriteShortcutImageUrls(response, origin) {
   })
 }
 
-async function handleShortcutImage(request, env) {
+async function handleShortcutImage(request, ctx, env) {
   const auth = await authorizePrivateRequest(request, env)
   if (!auth.ok) return unauthorizedResponse()
 
@@ -155,29 +152,13 @@ async function handleShortcutImage(request, env) {
     return Response.json({ success: false, error: '只允许 Instagram 图片地址。' }, { status: 400 })
   }
 
-  const upstream = await fetch(target, {
-    headers: {
-      Accept: IMAGE_ACCEPT,
-      Referer: 'https://www.instagram.com/',
-      'User-Agent': BROWSER_UA,
-    },
-    redirect: 'follow',
-  })
-  if (!upstream.ok) {
-    return Response.json(
-      { success: false, error: `Instagram 图片请求失败：${upstream.status}` },
-      { status: upstream.status },
-    )
-  }
-
-  const headers = new Headers({
-    'Content-Type': upstream.headers.get('content-type') || 'image/jpeg',
-    'Cache-Control': 'no-store',
-    'Content-Disposition': 'inline; filename="instagram-image.jpg"',
-  })
-  const contentLength = upstream.headers.get('content-length')
-  if (contentLength) headers.set('Content-Length', contentLength)
-  return new Response(upstream.body, { status: 200, headers })
+  const proxyUrl = new URL('/api/image', request.url)
+  proxyUrl.searchParams.set('url', target.toString())
+  const headers = new Headers(request.headers)
+  headers.delete(PRIVATE_AUTH_HEADER)
+  headers.set(PRIVATE_AUTH_HEADER, auth.kind || 'api')
+  const proxyRequest = new Request(proxyUrl, { method: 'GET', headers })
+  return API_ROUTES['/api/image'].handler(proxyRequest, ctx, env)
 }
 
 const worker = {
@@ -195,7 +176,7 @@ const worker = {
 
     if (url.pathname === SHORTCUT_IMAGE_PATH) {
       if (!methodMatches(request.method, 'POST')) return methodNotAllowed('POST')
-      return handleShortcutImage(request, env)
+      return handleShortcutImage(request, ctx, env)
     }
 
     const route = API_ROUTES[url.pathname]
